@@ -1,275 +1,212 @@
-# Test Plan: Daily Limit (`booking_limit`) — **Enforcement / Availability Filtering**
+# Test Plan: Lead Time & Business Hours — Daily and Weekly Regression Test Sets
 
-**Generated**: 2026-07-29
-**Extends**: `generated-plans/2026-07-06-daily-limit/test-plan.md` (TC-01→TC-29, frontend rule-builder vs mock API) — that plan explicitly held enforcement out of scope. This plan adds it. New IDs continue from **TC-30**.
-**Xray Test Plan**: ZPR-226789 "Scheduling Rules: Daily Limits" (currently holds 29 Tests, ZPR-227059→ZPR-227087)
-**Sources**: AVAIL-420, AVAIL-421, **AVAIL-422** (BookingLimitRule evaluation), **AVAIL-424** (read-path integration), AVAIL-459, **AVAIL-484** (count-query construction §4.8), AVAIL-478, AVAIL-486, AVAIL-488, AVAIL-493, AVAIL-568 (Limit rule E2E testing), AVAIL-589, SQUAWK-6537/6538 (AppointmentBox `/by-dimension`), SQUAWK-6883 (cross-source dedup), SQUAWK-6884 (exclude Manual Intake), SQUAWK-6765 (EHR eligibility), local `daily-limit-notes.md` (PRD §4.1/§4.3)
-**Testing Type(s)**: Integration + API (availability read path), cross-channel E2E
-**Environment**: **Staging — real backend + real EHR sandbox** (real AppointmentBox / AppointmentList, real 2-way-sync integration). Per user decision 2026-07-29.
-**Enforcement mode**: **ON** — AB enforcement flag flipped so exclusions actually filter slots. Per user decision 2026-07-29.
-**Total New Test Cases**: 36 (TC-30 → TC-65)
-**Priority Breakdown**: P0(20) P1(12) P2(4) P3(0)
+**Generated**: 2026-07-30
+**Sources**: User-defined scope (no Jira/Confluence/Figma/PR provided). Domain reasoning + stated fixtures.
+**Testing Type(s)**: Desktop Web (Intake Settings, PFS) + Mobile Web spot checks
+**Surfaces**: Intake Settings page (configuration) → PFS availability (verification)
+**Execution**: Manual regression, Jira/Xray test sets
+**Feature Flag**: N/A (confirm whether business-hours-aware lead time accrual sits behind a flag)
+**Total Test Cases**: 40 — Daily set: 14, Weekly set: 26
+**Priority Breakdown**: P0(16) P1(17) P2(7)
 
 ---
 
 ## Scope
 
 ### In Scope
-- **Count accrual by booking**: booking new and existing appointments until the configured daily limit is reached for a **specific date**, and observing availability disappear for that date.
-- **Boundary at the limit**: `count = limit-1` (slots present) → `count = limit` (whole day blocked) → `count > limit` (still blocked, no error).
-- **Whole-day exclusion semantics**: `SyntheticExclusion` with `StartDate = EndDate = date`, `TimeRanges = null` → the entire target date is blocked, adjacent dates untouched (AVAIL-422).
-- **Patient type dimension**: rule `patient_type` = `New` / `Existing` / `All`; `All` sums both counts (AVAIL-422).
-- **Provider integration shape**:
-  - **Non-EHR-integrated provider** (Zocdoc-native calendar, no PMS sync).
-  - **EHR-integrated provider, 2-way sync** — including the **double-count risk**: one physical appointment surfacing as both a Zocdoc-native record and an EHR-synced AppointmentList record.
-  - Appointments booked **directly in the EHR** (never through Zocdoc) counting toward the limit.
-- **Channels**: **Zo** (`phone_bot`), **Branded Directory** (`branded_directory`), and **Marketplace** (no channel param) — do the rule filters apply to availability in each.
-- **Cross-channel global counting** (PRD §4.1.9): a booking made on one channel shrinks availability on the others.
-- **Near-term vs long-term horizon**: both read paths — `GetFirstAvailability` (near term / next-available) and `GetAvailability` (date range) — at D+0/D+1/D+2, D+14, D+30, D+90, D+364, and at the count-query horizon edge (`now + 5 years`).
-- **Count exclusions** (PRD §2 counting rules): cancellations, no-shows, reschedules, Manual Intake records must NOT count.
-- **Timezone anchoring**: the calendar day in the provider's IANA local timezone, incl. the late-evening-crosses-UTC-midnight case and functional-duplicate zones (AVAIL-484).
-- **Count-source filter**: only `appointment_sources = [appointment_list]` is cap-relevant (AVAIL-484, legal mandate).
-- **Propagation latency**: time from booking → availability reflecting the new count (Valkey aggregate rebuild, AVAIL-486/488).
-- **Fail-open on read path** when AppointmentBox/count store is unavailable.
-- **Booking-time race condition** (PRD §4.3.8, open question).
+- Configuration of **hours of operation** and **minimum lead time** on the Intake Settings page (save, persist, validate).
+- **Availability rendering on PFS** as a consequence of that configuration: which timeslots appear, which are suppressed, day tabs, empty states.
+- **Business-hours-aware lead time counting** — lead time accruing only during open hours, across closed periods.
+- **Timezone and DST correctness** — provider-local vs patient-local rendering, spring-forward / fall-back, day-boundary rollover.
+- Propagation latency between an Intake Settings save and PFS reflecting it.
 
 ### Out of Scope
-- Everything already covered by the 2026-07-06 plan: rule-builder wizard UI, `buildPayload`, ReviewStep copy, integer BVA, mock-API behavior, page gating. **No enforcement case here re-tests rule creation** beyond using the UI/API as a fixture setup step.
-- **Shadow / audit mode** assertions (explainability events without filtering) — per user decision, enforcement-ON only. Shadow-mode gate coverage remains with AVAIL-428 / AVAIL-493.
-- **Provloc (per-location) daily limits** and hierarchical provloc-over-provider override — deferred phase (PRD §4.1.34/§4.1.35).
-- **Non-daily periods** (daypart, day-of-week, week, month) — MVP is daily only.
-- Backfill job (AVAIL-491), reconciliation endpoint (AVAIL-492), Kinesis/Firehose explainability export (AVAIL-429), latency SLA load testing (AVAIL-426).
-- Insurance taxonomy depth (Carrier/Network/Program) beyond one smoke case — the MVP rule builder requires limit + patient type only.
+- Completing a booking end-to-end past slot selection (payment, insurance, intake questions) — only the lead-time-boundary book attempt (TC-D14) is covered.
+- Partner/syndication surfaces consuming the same availability.
+- Backend availability-service contract testing at the API layer.
+- Search results page ranking/filtering — PFS only.
+- Provider-side calendar/blocked-time management outside the Intake Settings hours fields.
 
 ---
 
-## Test Fixtures (build these first — every case below references them)
+## Assumptions
 
-| ID | Fixture | Detail |
-|---|---|---|
-| **PROV-A** | Non-EHR-integrated provider | Zocdoc-native calendar, no PMS/EHR sync. Bookable on Zo + Branded Directory + Marketplace. Open availability across D+0 → D+400. |
-| **PROV-B** | EHR-integrated provider, **2-way sync** | Real EHR sandbox, bidirectional sync enabled, AppointmentList-enrolled + consented. Same availability span as PROV-A. |
-| **PROV-C** | Control provider | Same practice as PROV-B, **no** daily-limit rule. Used to prove exclusions are provider-scoped. |
-| **PROV-D** | Multi-location, multi-timezone provider | One location `America/Los_Angeles`, one `America/New_York`; a third location on a functional-duplicate zone (`US/Eastern`) per AVAIL-484. |
-| **RULE-1** | Daily limit, `patient_type = New`, `max_count = 2` | On PROV-A and PROV-B (separate rules). Single visit reason VR-1. |
-| **RULE-2** | Daily limit, `patient_type = All`, `max_count = 2` | On PROV-A. Used for the summing cases. |
-| **RULE-3** | Daily limit, `patient_type = Existing`, `max_count = 3` | On PROV-B. |
-| **RULE-4** | Multi-VR daily limit, `max_count = 3`, VRs {VR-1, VR-2, VR-3} | On PROV-A. "Max 3 cosmetic/day across several VRs" (PRD §4.1.10). |
-| **DATE-N** | Near-term target date | D+2 (provider-local), fully open, no pre-existing appointments. |
-| **DATE-F** | Far-term target date | D+14 (provider-local) — the horizon already manually tested. |
-| **DATE-XF** | Extra-far target date | D+90 and D+364 — the "further out" ask. |
+Every one of these should be confirmed before the sets are imported. Each is marked `ASSUMPTION` where it drives an expected result.
 
-> **PHI**: all fixtures use synthetic staging patients. Do not copy appointment IDs, patient names, DOBs, or EHR payloads out of staging into tickets, Slack, or any external destination.
+| # | Assumption | Affects |
+|---|-----------|---------|
+| A1 | "Lead time" = minimum booking notice; a slot is bookable only if `slot_start >= now + lead_time`. | All lead time cases |
+| A2 | Business-hours-aware accrual means the lead time clock advances **only during configured open hours**; time while closed does not count down. | TC-D06, TC-W07–W10 |
+| A3 | PFS displays timeslots in the **provider location's** timezone, with an explicit timezone label. | TC-D08, TC-D09, TC-W14–W16 |
+| A4 | A slot is only offered if the **full appointment duration** fits before the closing time. | TC-D11, TC-W05 |
+| A5 | Intake Settings supports multiple open/close blocks per day (i.e., a midday closure). | TC-D12, TC-W04 |
+| A6 | Lead time is configured per provider/location, and may differ for in-person vs video and new vs returning patients. | TC-W19, TC-W20 |
+| A7 | There is a documented propagation SLA between save and PFS reflection (cache TTL). Substitute the real number for `{SLA}`. | TC-D13, TC-W25 |
+
+---
+
+## Standard Fixtures
+
+Reuse these across both sets so cases stay short and results are comparable run over run.
+
+| Fixture | Definition |
+|---------|-----------|
+| **PROV-A** | Single location, TZ `America/New_York`. Mon–Fri 09:00–17:00, midday closure 12:00–13:00, Sat/Sun closed. Appointment duration 30 min. Min lead time 2 hours. Business-hours-aware accrual ON. |
+| **PROV-B** | Single location, TZ `America/Los_Angeles`. Mon–Sun 08:00–20:00. Duration 20 min. Min lead time 4 hours. |
+| **PROV-C** | Single location, TZ `America/Phoenix` (no DST) — the DST control provider. Mon–Fri 09:00–17:00. Min lead time 1 hour. |
+| **PROV-D** | Two locations, different timezones (`America/New_York`, `America/Chicago`) and different hours. |
+| **PATIENT-PT** | Browser/device set to `America/Los_Angeles`. |
+| **PATIENT-ET** | Browser/device set to `America/New_York`. |
+
+---
+
+# DAILY REGRESSION TEST SET
+
+**Test Set name**: `Regression — Daily — Lead Time & Business Hours`
+**Target runtime**: ~45–60 min manual
+**Selection rationale**: every case here either blocks booking outright when broken, or is a silent-failure mode (wrong times shown, slots wrongly hidden) that costs patient-facing volume within hours of a bad deploy. All are P0/P1 and all use a single provider fixture to keep setup cheap.
+
+| ID | Component | Summary | Preconditions | Steps | Expected Result | Test Data | Priority | Category | Source |
+|----|-----------|---------|---------------|-------|-----------------|-----------|----------|----------|--------|
+| TC-D01 | Intake Settings | Hours of operation save and persist | Logged in with access to PROV-A Intake Settings | 1. Open Intake Settings for PROV-A<br>2. Set Mon–Fri 09:00–17:00, Sat/Sun closed<br>3. Save<br>4. Hard-reload the page | Save confirmation appears; after reload each weekday row shows `09:00 AM – 05:00 PM` and Sat/Sun show the closed state. No field reverts to a default. | PROV-A | P0 | Happy Path | INFERRED |
+| TC-D02 | Intake Settings | Minimum lead time saves and persists | PROV-A loaded | 1. Set minimum lead time to `2 hours`<br>2. Save<br>3. Reload | Field reads `2 hours` after reload; no rounding to a different unit and no reset to the account default. | lead time = 2h | P0 | Happy Path | INFERRED |
+| TC-D03 | PFS | Slots render only inside configured business hours | PROV-A configured per fixture; current time Tue 08:00 ET | 1. Open PFS for PROV-A as PATIENT-ET<br>2. Inspect Wednesday's slot list | Earliest Wednesday slot is `9:00 AM`, latest is `4:30 PM`. No slot before 9:00 AM or at/after 5:00 PM is offered. | PROV-A, Wed | P0 | Happy Path | ASSUMPTION A4 |
+| TC-D04 | PFS | Closed day shows no availability | PROV-A, Sat/Sun closed | 1. Open PFS for PROV-A<br>2. Navigate to the upcoming Saturday and Sunday | Both days render zero timeslots and show the no-availability state for that day; the day is not silently skipped without indication. | PROV-A, Sat + Sun | P0 | Negative | INFERRED |
+| TC-D05 | PFS | Lead time boundary — slot exactly at `now + lead time` is offered | PROV-A, lead time 2h; current time Tue 10:00 ET | 1. Open PFS<br>2. Inspect Tuesday's slots | The `12:00 PM` boundary is unavailable due to the midday closure, so the first offered Tuesday slot is `1:00 PM`. Repeat with the midday closure removed: the `12:00 PM` slot IS offered (inclusive boundary). | now=Tue 10:00 ET | P0 | BVA | ASSUMPTION A1 |
+| TC-D06 | PFS | Business-hours-aware accrual — after-hours lead time rolls to next open day | PROV-A, accrual ON; current time Fri 16:30 ET (30 min before close) | 1. Open PFS for PROV-A<br>2. Identify the first bookable slot | 30 min of the 2h lead time accrues before Friday 17:00; the remaining 90 min accrues from Monday 09:00. First bookable slot is **Monday 10:30 AM**. No Saturday, Sunday, or Friday-evening slot is offered. | now=Fri 16:30 ET | P0 | Business Rule | ASSUMPTION A2 |
+| TC-D07 | PFS | Slots before `now + lead time` are suppressed | PROV-A; current time Tue 10:00 ET | 1. Open PFS<br>2. Inspect the Tuesday slot list for anything earlier than the boundary | No Tuesday slot at or before `11:30 AM` is offered. Past-time slots (09:00, 09:30, 10:00) are absent, not greyed-but-clickable. | now=Tue 10:00 ET | P0 | Negative | ASSUMPTION A1 |
+| TC-D08 | PFS | Times render in provider-location timezone with a visible label | PROV-A (ET); browser set to PATIENT-PT | 1. Set browser TZ to `America/Los_Angeles`<br>2. Open PFS for PROV-A | Slots still read `9:00 AM – 4:30 PM` and a timezone indicator identifies them as provider-local Eastern time. Times are NOT shifted to `6:00 AM – 1:30 PM`. | PROV-A + PATIENT-PT | P0 | Date/Time | ASSUMPTION A3 |
+| TC-D09 | PFS | Cross-timezone provider renders its own hours | PROV-B (PT); browser set to PATIENT-ET | 1. Set browser TZ to `America/New_York`<br>2. Open PFS for PROV-B | Slots read `8:00 AM – 7:40 PM` Pacific with the Pacific timezone label. The window is not clipped or shifted by the Eastern browser. | PROV-B + PATIENT-ET | P0 | Date/Time | ASSUMPTION A3 |
+| TC-D10 | PFS | Zero lead time — immediate booking | PROV-A with lead time set to `0`; current time Tue 10:05 ET | 1. Set lead time to 0 on Intake Settings, save<br>2. Open PFS after propagation | The next future slot (`10:30 AM`) is offered. No already-started slot (`10:00 AM`) is offered. | lead time = 0 | P1 | BVA | ASSUMPTION A1 |
+| TC-D11 | PFS | Last slot of the day fits the full appointment duration | PROV-A, 30-min duration, closes 17:00 | 1. Open PFS<br>2. Inspect the final slot of any open weekday | Final slot is `4:30 PM`. No `4:45 PM` or `5:00 PM` slot is offered — a slot that would end after close is suppressed. | PROV-A | P1 | BVA | ASSUMPTION A4 |
+| TC-D12 | PFS | Midday closure produces a gap, not a merged block | PROV-A with 12:00–13:00 closure | 1. Open PFS<br>2. Inspect a fully-open future weekday | Slots run 9:00–11:30 AM, then resume at 1:00 PM. No slot exists at 12:00 PM or 12:30 PM. | PROV-A, day+3 | P1 | Business Rule | ASSUMPTION A5 |
+| TC-D13 | Intake Settings → PFS | Config change propagates to PFS | PROV-A open in Intake Settings; PFS open in a second tab | 1. Change closing time from 17:00 to 15:00, save<br>2. Wait `{SLA}`<br>3. Reload PFS | Within `{SLA}`, the last offered slot on future weekdays becomes `2:30 PM`. No 3:00–4:30 PM slot remains after the propagation window. | close 17:00→15:00 | P0 | Data Integrity | ASSUMPTION A7 |
+| TC-D14 | PFS | Boundary slot is actually bookable, not just displayed | PROV-A; a slot at exactly `now + lead time` is visible on PFS | 1. Select the earliest offered slot<br>2. Proceed to the point of appointment confirmation | The slot is accepted and the flow advances. No "this time is no longer available" or lead-time-violation error is raised for a slot the page just offered. | earliest offered slot | P0 | Data Integrity | INFERRED |
+
+---
+
+# WEEKLY REGRESSION TEST SET
+
+**Test Set name**: `Regression — Weekly — Lead Time & Business Hours`
+**Target runtime**: ~3–4 hours manual
+**Selection rationale**: permutations, DST, holidays, multi-location, and validation matrices. These break less often and are expensive to set up (clock manipulation, multiple fixtures), but each is a real production failure mode. Run the daily set first — if it fails, don't burn time here.
+
+### Business-Hours-Aware Accrual (deep)
+
+| ID | Component | Summary | Preconditions | Steps | Expected Result | Test Data | Priority | Category | Source |
+|----|-----------|---------|---------------|-------|-----------------|-----------|----------|----------|--------|
+| TC-W01 | PFS | Accrual across a full closed weekend | PROV-A, accrual ON, lead time 2h; current time Sat 12:00 ET | 1. Set clock to Saturday noon<br>2. Open PFS | No accrual occurs over the weekend. First bookable slot is **Monday 11:00 AM** (2h after Monday's 09:00 open). | now=Sat 12:00 ET | P0 | Business Rule | ASSUMPTION A2 |
+| TC-W02 | PFS | Accrual spans the midday closure | PROV-A, lead time 2h; current time Tue 11:00 ET | 1. Set clock to Tue 11:00<br>2. Open PFS | 1h accrues 11:00–12:00; the closure does not count; the remaining 1h accrues from 13:00. First bookable slot is **Tuesday 2:00 PM**. | now=Tue 11:00 ET | P0 | Business Rule | ASSUMPTION A2 |
+| TC-W03 | PFS | Lead time longer than a single business day | PROV-A, lead time set to `12 hours`; current time Mon 10:00 ET | 1. Set lead time to 12h, save<br>2. Open PFS after propagation | Accrual: 7h Mon (10:00–17:00 less the 1h closure = 6h), continuing Tue. First bookable slot lands **Wednesday morning** per the accrual arithmetic — record the exact slot and assert it does not fall outside business hours or on a closed day. | lead time = 12h | P1 | Business Rule | ASSUMPTION A2 |
+| TC-W04 | PFS | Accrual with multiple closures in one day | PROV-A extended to 09:00–12:00, 13:00–15:00, 16:00–18:00 | 1. Configure three blocks, save<br>2. Set clock to 11:30, open PFS with lead time 2h | Accrual: 30 min (11:30–12:00) + 90 min from 13:00. First bookable slot is **2:30 PM**. No slot at 12:00–12:30 or 15:00–15:30. | 3 blocks | P1 | Business Rule | ASSUMPTION A5 |
+| TC-W05 | PFS | Boundary lands mid-closure | PROV-A, lead time 2h; current time Tue 10:30 ET | 1. Set clock to Tue 10:30, open PFS | Raw boundary would be 12:30 PM, inside the closure. First offered slot is **1:00 PM** — the boundary is pushed forward to the next open slot, not dropped to the following day, and not offered at 12:30. | now=Tue 10:30 ET | P0 | BVA | ASSUMPTION A2 |
+| TC-W06 | PFS | Accrual toggle OFF behaves as wall-clock | PROV-A with business-hours-aware accrual disabled; current time Fri 16:30 ET | 1. Disable accrual, save<br>2. Open PFS | With wall-clock counting, the boundary is Friday 18:30 — outside hours — so the first slot is **Monday 9:00 AM** (the first in-hours slot at or after the boundary), NOT Monday 10:30 AM. Contrast against TC-D06. | accrual OFF | P1 | Feature Toggle | ASSUMPTION A2 |
+| TC-W07 | PFS | Accrual when the provider is closed all of the next day | PROV-A with Wednesday additionally closed; current time Tue 16:45 ET | 1. Close Wednesday, save<br>2. Set clock to Tue 16:45, open PFS | 15 min accrues Tuesday; Wednesday contributes nothing; remaining 1h45 accrues from Thursday 09:00. First bookable slot is **Thursday 10:45 AM**. No Wednesday slot appears. | Wed closed | P1 | Business Rule | ASSUMPTION A2 |
+
+### Timezone & DST
+
+| ID | Component | Summary | Preconditions | Steps | Expected Result | Test Data | Priority | Category | Source |
+|----|-----------|---------|---------------|-------|-----------------|-----------|----------|----------|--------|
+| TC-W08 | PFS | Spring-forward — the missing hour is not offered | PROV-A; clock set to the US DST spring-forward date, hours temporarily 01:00–06:00 | 1. Set hours to 01:00–06:00 on the spring-forward Sunday<br>2. Open PFS for that date | No slot is offered between 2:00 AM and 2:59 AM (the hour that does not exist). Slots run 1:00, 1:30, then 3:00 onward. No duplicate or shifted-by-one-hour slots. | spring-forward Sun | P0 | Date/Time | ASSUMPTION A3 |
+| TC-W09 | PFS | Fall-back — the repeated hour is not double-listed | PROV-A; clock set to the US DST fall-back date, hours 00:00–06:00 | 1. Configure hours, open PFS for that date | The 1:00–1:59 AM hour appears exactly once. There are no two indistinguishable `1:00 AM` slots, and total slot count for the day matches the configured window. | fall-back Sun | P0 | Date/Time | ASSUMPTION A3 |
+| TC-W10 | PFS | Lead time boundary crossing the spring-forward transition | PROV-A, lead time 4h; current time set to the night before spring-forward, 23:00 ET | 1. Set clock to 23:00 the night before spring-forward<br>2. Open PFS | The boundary accounts for the lost hour: the first bookable slot is 4 real elapsed hours later in local wall-clock terms (i.e., 4:00 AM local, not 3:00 AM). Assert against a computed expected value, not the UI's own arithmetic. | spring-forward eve | P0 | Date/Time | ASSUMPTION A1+A3 |
+| TC-W11 | PFS | Lead time boundary crossing the fall-back transition | PROV-A, lead time 4h; clock set to 23:00 the night before fall-back | 1. Set clock, open PFS | The boundary accounts for the extra hour: first bookable slot is 4 real elapsed hours later (2:00 AM local after the repeat), and no slot before the true boundary is offered. | fall-back eve | P0 | Date/Time | ASSUMPTION A1+A3 |
+| TC-W12 | PFS | No-DST provider is unaffected by the transition | PROV-C (`America/Phoenix`) | 1. Set clock to each DST transition date<br>2. Open PFS for PROV-C | Hours render `9:00 AM – 4:30 PM` unchanged on both transition dates. No slot shifts by an hour relative to a non-transition weekday. | PROV-C | P1 | Date/Time | ASSUMPTION A3 |
+| TC-W13 | PFS | Patient in a DST-observing TZ viewing a non-DST provider | PROV-C; PATIENT-ET, clock on a DST transition date | 1. Set browser to ET on the transition date<br>2. Open PFS for PROV-C | Provider-local Phoenix times render unchanged with the correct timezone label; the patient's own transition does not shift the displayed slots. | PROV-C + PATIENT-ET | P1 | Date/Time | ASSUMPTION A3 |
+| TC-W14 | PFS | Day-boundary rollover — lead time pushes the first slot to tomorrow | PROV-B (08:00–20:00 PT), lead time 4h; current time 18:30 PT | 1. Set clock to 18:30 PT<br>2. Open PFS for PROV-B | First bookable slot is on the **next calendar day**; "Today" shows no availability and the next-day tab is the first with slots. The next-day date label matches the provider-local date, not the patient-local date. | now=18:30 PT | P1 | Date/Time | ASSUMPTION A1 |
+| TC-W15 | PFS | Patient near midnight in a TZ ahead of the provider | PROV-B (PT); PATIENT-ET at 00:30 ET (= 21:30 PT previous day) | 1. Set browser to ET, clock to 00:30<br>2. Open PFS for PROV-B | The "Today" tab reflects the **provider's** current date. Slot dates and day labels are self-consistent — the page does not show a day tab whose slots belong to a different date. | midnight cross-TZ | P1 | Date/Time | ASSUMPTION A3 |
+| TC-W16 | Intake Settings | Location timezone change updates PFS rendering | PROV-A | 1. Change the location timezone from `America/New_York` to `America/Chicago`, save<br>2. Wait `{SLA}`, reload PFS | PFS slots read `9:00 AM – 4:30 PM` **Central** with the Central label. The configured 09:00–17:00 hours are reinterpreted in the new zone; they are not converted to `8:00 AM – 3:30 PM`. Confirm which behaviour is intended before asserting. | TZ change | P1 | Date/Time | OPEN QUESTION |
+
+### Configuration, Validation & Propagation
+
+| ID | Component | Summary | Preconditions | Steps | Expected Result | Test Data | Priority | Category | Source |
+|----|-----------|---------|---------------|-------|-----------------|-----------|----------|----------|--------|
+| TC-W17 | Intake Settings | Invalid hours are rejected | PROV-A | 1. Set Monday close time earlier than open (17:00 open, 09:00 close)<br>2. Attempt save | Save is blocked; an inline validation message identifies the Monday row; no partial write occurs (reload shows the prior valid values). | close < open | P1 | Input Validation | INFERRED |
+| TC-W18 | Intake Settings | Overlapping blocks are rejected or merged deterministically | PROV-A | 1. Add blocks 09:00–13:00 and 12:00–17:00 on the same day<br>2. Save | Either save is blocked with an overlap message, or the blocks merge to a single 09:00–17:00 range — whichever the product specifies. Assert the same outcome on PFS: no duplicated 12:00–13:00 slots. | overlapping blocks | P1 | Input Validation | OPEN QUESTION |
+| TC-W19 | Intake Settings | Lead time field boundary values | PROV-A | 1. Attempt to save lead time of `0`, the documented maximum, maximum+1, a negative value, and a non-numeric value | 0 and the maximum save successfully. Maximum+1, negative, and non-numeric are rejected with a field-level message and no write. Record the actual max in the test data column once confirmed. | 0 / max / max+1 / -1 / "abc" | P1 | BVA | INFERRED |
+| TC-W20 | Intake Settings → PFS | Different lead time for in-person vs video | PROV-A with in-person lead time 2h, video lead time 30 min | 1. Configure both, save<br>2. On PFS, toggle between in-person and video | Each visit type shows its own boundary: the video list starts 30 min out, the in-person list 2h out. Switching the toggle re-computes the list rather than reusing the previous type's slots. | 2h vs 30m | P1 | Business Rule | ASSUMPTION A6 |
+| TC-W21 | Intake Settings → PFS | Different lead time for new vs returning patients | PROV-A with new-patient lead time 24h, returning 2h | 1. Configure both, save<br>2. On PFS, switch the patient-type selection | New-patient availability starts ~24h out (business-hours-adjusted); returning starts 2h out. The two lists differ and each independently respects business hours. | 24h vs 2h | P1 | Business Rule | ASSUMPTION A6 |
+| TC-W22 | Intake Settings → PFS | Holiday / one-off closure suppresses that date | PROV-A | 1. Add a one-off closure for a specific future weekday, save<br>2. Open PFS for that date | That date shows zero slots and the no-availability state. Adjacent dates are unaffected. Lead time accrual skips the closed date (see TC-W07 pattern). | one-off closure | P1 | Business Rule | INFERRED |
+| TC-W23 | Intake Settings → PFS | Multi-location — each location keeps its own hours and timezone | PROV-D (2 locations, ET and CT, different hours) | 1. Configure distinct hours per location, save<br>2. On PFS, switch between locations | Each location renders its own hours in its own timezone with the correct label. Switching locations fully re-computes the slot list; no slot from the previous location persists. | PROV-D | P1 | Data Integrity | INFERRED |
+| TC-W24 | PFS | Availability horizon end | PROV-A | 1. Navigate PFS forward to the last bookable date, then one beyond | The final in-horizon date renders slots normally; the date beyond the horizon shows the no-availability/end-of-horizon state rather than an error or an infinite scroll. | horizon edge | P2 | Edge Case | INFERRED |
+| TC-W25 | Intake Settings → PFS | Propagation under rapid successive edits | PROV-A | 1. Change closing time three times in quick succession (17:00 → 15:00 → 16:00), saving each<br>2. Wait `{SLA}`, reload PFS | PFS settles on the **last** saved value (16:00 close, last slot 3:30 PM). No intermediate value (15:00) persists, and no stale 17:00 slots remain. | 3 rapid saves | P2 | Data Integrity | ASSUMPTION A7 |
+| TC-W26 | PFS (Mobile Web) | Mobile viewport parity for hours and lead time | PROV-A; mobile browser | 1. Open PFS for PROV-A on a mobile viewport<br>2. Compare the offered slot list against the desktop run of TC-D03 and TC-D05 | The mobile slot list matches desktop exactly — same first slot, same last slot, same closure gap, same timezone label. No slot is truncated by the mobile layout. | mobile 390×844 | P2 | Visual/Layout | INFERRED |
 
 ---
 
 ## Coverage Matrix
 
-| Requirement / Concern | Source | Test Cases | Covered? |
-|---|---|---|---|
-| Booking new appointments accrues count until limit reached for a specific date | REQ:PRD-4.1.5; AVAIL-422 | TC-30, TC-31, TC-32 | Yes |
-| Booking existing-patient appointments accrues count | REQ:PRD-4.1.5; AVAIL-422 | TC-33 | Yes |
-| `PatientType.All` sums new + existing | AVAIL-422 | TC-34 | Yes |
-| Patient-type-scoped rule leaves the other patient type bookable | AVAIL-422 | TC-35 | Yes |
-| `count = limit` blocks the **whole day**, `TimeRanges = null` | AVAIL-422 | TC-36 | Yes |
-| Adjacent dates unaffected; exclusion is provider-scoped | AVAIL-422 | TC-37 | Yes |
-| Multi-VR rule combines counts across the VR set | AVAIL-422; PRD §4.1.10 | TC-38 | Yes |
-| Non-EHR provider: Zocdoc-native bookings reach the count store as `appointment_list` | AVAIL-484; **Open Q1** | TC-39 | Yes (risk) |
-| 2-way sync: one appointment counted **once**, not twice | AVAIL-484; SQUAWK-6883; **user concern** | TC-40, TC-41, TC-42 | Yes |
-| EHR-native (booked in PMS) appointments count toward the limit | PRD §4.1.9; AVAIL-484 | TC-43 | Yes |
-| Zo (`phone_bot`) availability respects the rule | PRD §4.3.11; AVAIL-424 | TC-44 | Yes |
-| Branded Directory (`branded_directory`) availability respects the rule | PRD §4.3.11; AVAIL-424 | TC-45 | Yes |
-| Marketplace (no channel param) — does the filter apply? | **Open Q2** (contradiction) | TC-46 | Yes (probe) |
-| Counting is global across channels | PRD §4.1.9 | TC-47 | Yes |
-| Near-term filtering: `GetFirstAvailability` path, D+0/D+1/D+2 | AVAIL-424; **user regression ask** | TC-48, TC-61 | Yes |
-| Long-term filtering: `GetAvailability` path, D+14 | AVAIL-424; user manual test | TC-49, TC-62 | Yes |
-| Further-out filtering: D+30 / D+90 / D+364 | **user ask ("go further out")** | TC-50 | Yes |
-| Count-query horizon edge: `now + 5 years` and beyond | AVAIL-484 | TC-51 | Yes |
-| `from = yesterday 00:00 UTC` lower edge / same-day D+0 | AVAIL-484 | TC-52 | Yes |
-| Cancellation decrements the count / returns the day | PRD §2 counting rules | TC-53 | Yes |
-| No-show does not count | AVAIL-484 status filter | TC-54 | Yes |
-| Reschedule moves the count between dates | PRD §2 counting rules | TC-55 | Yes |
-| Manual Intake records do not count | SQUAWK-6884; PRD §2 | TC-56 | Yes |
-| Timezone anchoring: provider-local calendar day, late-evening UTC rollover | AVAIL-484; PRD §2 | TC-57 | Yes |
-| Multi-timezone provider + functional-duplicate zone dedup | AVAIL-484 | TC-58 | Yes |
-| Propagation latency booking → availability | AVAIL-486, AVAIL-488 | TC-59 | Yes |
-| Fail-open when count store unavailable | AVAIL-422 ("empty counts → empty exclusions") | TC-60 | Yes |
-| Booking-time race at `limit - 1` | PRD §4.3.8 (open) | TC-63 | Yes (probe) |
-| Overbooked beyond limit stays blocked, no error | INFERRED | TC-64 | Yes |
-| Insurance-scoped limit counts only the matching carrier | PRD §4.1.7 | TC-65 | Smoke only |
-| Non-enrolled / no-rules provider skips evaluation cleanly | AVAIL-478, AVAIL-589 | TC-37 | Partial |
+| Behaviour | Daily coverage | Weekly coverage |
+|-----------|----------------|-----------------|
+| Hours config saves and persists | TC-D01, TC-D02 | TC-W17, TC-W18, TC-W19 |
+| Slots confined to business hours | TC-D03, TC-D04, TC-D11, TC-D12 | TC-W04, TC-W22, TC-W24 |
+| Lead time boundary enforcement | TC-D05, TC-D07, TC-D10, TC-D14 | TC-W05, TC-W19 |
+| Business-hours-aware accrual | TC-D06 | TC-W01–W07 |
+| Timezone rendering | TC-D08, TC-D09 | TC-W12, TC-W13, TC-W15, TC-W16, TC-W23 |
+| DST transitions | *(none — weekly only)* | TC-W08–W11 |
+| Day-boundary rollover | *(partial via TC-D06)* | TC-W14, TC-W15 |
+| Config propagation | TC-D13 | TC-W25 |
+| Visit-type / patient-type variants | *(none)* | TC-W20, TC-W21 |
+| Mobile parity | *(none)* | TC-W26 |
+
+DST is deliberately weekly-only: it requires clock manipulation and is only genuinely at risk twice a year — but it is P0 within the weekly set, and worth promoting to daily for the two weeks surrounding each transition.
 
 ---
 
 ## Risk Register
 
 | Risk | Impact | Likelihood | Mitigation | Related Tests |
-|---|---|---|---|---|
-| **2-way-sync double count** — a Zocdoc booking is written to the EHR, syncs back, and lands in AppointmentList as a second record for the same physical appointment. Limit of 3 is hit after 2 real bookings. | **High** — silently removes real, bookable availability; provider loses patients and it looks like "Zocdoc broke my calendar" | **Medium-High** (user-raised; appointment-level dedup lives in AppointmentBox per SQUAWK-6883, *not* in AVAIL-484 — AVAIL-484's "functional dedup" is **timezone** dedup only, a commonly conflated distinction) | Explicit A/B comparison of AppointmentBox `/by-dimension` counts for PROV-A (non-EHR) vs PROV-B (2-way sync) after an identical booking sequence; inspect raw buckets, not just the filtered outcome | **TC-40, TC-41, TC-42** |
-| **Non-EHR provider may never enforce** — the count query filters `appointment_sources = [appointment_list]`. If a Zocdoc-native provider has no AppointmentList feed, count is always 0 and the limit never fires. | **High** — rule appears saved and active in the UI but does nothing; false confidence | Medium (unverified; SQUAWK-6765 gates the UI to EHR-eligible practices, implying non-EHR may be intentionally unsupported) | TC-39 asserts the actual count-store contents for PROV-A before asserting any filtering. If count is 0, this is a **finding, not a test failure** — escalate to Open Q1 | **TC-39** |
-| **Marketplace filters when the rollout plan says it shouldn't** — rules are wired into `AvailabilityControllerHelper`, which is channel-agnostic, but PRD §4.3.11 launches Zo + Branded Directory first, Marketplace later. | Medium — either premature Marketplace enforcement or an unimplemented channel gate | Medium (design contradiction, see Open Q2) | TC-46 probes and records actual behavior; expected result deliberately written as a decision point, not a pass/fail guess | **TC-46** |
-| **Near-term vs long-term path divergence** — `GetAvailability` and `GetFirstAvailability` are separately wired (AVAIL-424). A fix to one may not cover the other. | High — near-term slots are the highest-converting availability; a leak there means patients book past the cap | Medium (this is the shape of the bug the user already fixed once) | Symmetric coverage: every horizon assertion runs through **both** read paths | **TC-48, TC-49, TC-50, TC-61, TC-62** |
-| **Horizon ceiling** — count query runs to `now + 5 years`; availability beyond that is unfiltered. | Low-Medium — far-future booking is rare but unbounded | Low | TC-51 documents actual behavior at and past the edge | **TC-51** |
-| **Timezone anchoring off-by-one-day** — a 9pm PT appointment is 04:00 UTC the next day; if counted against the UTC date the wrong calendar day gets blocked. | High — blocks a day that isn't full while leaving the full day open | Medium | TC-57 books deliberately at the UTC rollover boundary | **TC-57** |
-| **Stale counts / propagation lag** — event-driven Valkey rebuild means availability may lag the booking. | Medium — over-booking window, or slots that stay hidden after a cancel | Medium | TC-59 measures and bounds the lag; TC-53 checks the decrement direction | **TC-59, TC-53** |
-| **Fail-open hides enforcement failure** — AVAIL-422 returns empty exclusions when counts are unavailable, so a broken count store looks like "no limit configured". | Medium — silent non-enforcement in production | Medium | TC-60 verifies fail-open is graceful **and** observable (alarm/metric fires) | **TC-60** |
-| **Booking-time race** (PRD §4.3.8, unresolved) — two patients hold slots at `limit - 1`. | Medium — cap exceeded by one | Medium (no revalidation confirmed) | TC-63 is a probe; result feeds Open Q3 | **TC-63** |
+|------|--------|------------|------------|---------------|
+| Lead time computed in UTC but compared against provider-local wall clock | High — whole days of availability wrongly hidden or wrongly offered | Med | Cross-TZ and DST cases run against a computed expected value, never the UI's own arithmetic | TC-D08, TC-W10, TC-W11 |
+| Business-hours accrual silently falls back to wall-clock counting | High — patients offered slots the practice can't honour | Med | Contrast pair TC-D06 (ON) vs TC-W06 (OFF) makes a silent fallback visible | TC-D06, TC-W06 |
+| PFS renders slots the booking service later rejects | High — patient-visible failure at the last step | Med | Boundary slot is booked, not just observed | TC-D14 |
+| Cache serves stale hours after a config change | Med — provider believes a change took effect | High | Propagation cases with an explicit `{SLA}` and a rapid-edit case | TC-D13, TC-W25 |
+| Appointment duration ignored at the closing boundary | Med — appointments overrun close | Med | Last-slot-fits assertions | TC-D11, TC-W05 |
+| Clock manipulation in the test environment is unreliable | Med — cases silently pass without exercising the boundary | High | Record the observed environment time in every time-sensitive case before asserting | All time-sensitive cases |
 
 ---
 
 ## Open Questions
 
-1. **Does a non-EHR-integrated provider enforce at all?** `appointment_sources = [appointment_list]` is the only cap-relevant source (AVAIL-484, described as a legal mandate). SQUAWK-6765 gates the rule-builder UI to practices with an eligible EHR. If PROV-A has no AppointmentList feed its count is permanently 0 and RULE-1/2/4 are inert. **Confirm whether non-EHR providers are in scope for enforcement at all** — if not, TC-39 becomes a negative test (rule must not be creatable) and TC-30–TC-38 should run on PROV-B only.
-2. **Marketplace channel gate.** Rules are applied inside `AvailabilityControllerHelper` (AVAIL-424), which serves all channels. PRD §4.3.11 + the Rollout Plan say Zo and Branded Directory launch first, Marketplace later. Is there a channel-level gate, is Marketplace enforcement intentional, or is it an unimplemented gap? TC-46 records observed behavior either way.
-3. **Booking-time revalidation** (PRD §4.3.8, still open). Is availability re-evaluated at booking commit, or only at slot-presentation time? Determines whether TC-63 is a bug or a documented limitation.
-4. **Rule-eval failure fallback** (PRD §4.3.9, still a `<<Fallback behavior>>` placeholder). AVAIL-422 implies fail-open. Confirm intended behavior and whether a metric/alarm exists (AVAIL-496 is To Do) — TC-60's observability assertion depends on this.
-5. **Which appointment-level dedup is authoritative for 2-way sync**, and is it live in staging? SQUAWK-6883 ("Harden cross-source de-duplication and appointment correlation") is **To Do**. If dedup is not yet shipped, TC-40/TC-41 may legitimately fail — that is the finding, not a blocker.
-6. **Near/long-term regression anchor.** The bug being guarded was described verbally ("filter near term as well as longer term"), with no ticket. TC-61/TC-62 are tagged `INFERRED`. Provide the ticket key to re-anchor them to the real root cause and tighten the assertions.
-7. **Propagation SLA.** Is there a stated bound for booking → availability reflection? TC-59 currently asserts against a 60s working threshold that needs product/eng confirmation.
-8. **Enforcement AB flag name and scoping unit** (AVAIL-420 / AVAIL-430). Needed to flip enforcement ON in staging; scope (practice? provider? location?) affects fixture setup.
-
----
-
-## Assumptions
-
-- **ASSUMPTION**: Staging has a working EHR sandbox with true bidirectional sync for PROV-B, and PROV-B's practice is AppointmentList-enrolled **and** consented. Without consent the counts never populate and every PROV-B case is blocked.
-- **ASSUMPTION**: The enforcement AB flag can be flipped ON for the fixture practices in staging (Open Q8), and rules are read from the Availability-owned cache path in effect at test time (AVAIL-396/397).
-- **ASSUMPTION**: "Achieving the daily limit" is asserted as **slots disappearing from availability reads**, not as a booking-time rejection — AVAIL-422/424 filter at presentation time. If booking-time rejection is also expected, that is additional scope (see Open Q3).
-- **ASSUMPTION**: Whole-day blocking is intended at `count >= limit` (`TimeRanges = null`), so a partially-booked day flips entirely unavailable rather than exposing leftover slots. Called out because it is counter-intuitive to practices and will draw questions.
-- **ASSUMPTION**: `D+0`/`D+2`/`D+14` are evaluated in the **provider's** local timezone, not the tester's.
-- **ASSUMPTION**: Rule creation itself is a fixture step. Where the rule-builder UI is unavailable for a needed shape (e.g. multi-VR RULE-4), the rule is seeded via `POST /provider-preference-rules/v1/rules` against the real service.
-- **ASSUMPTION**: TC-61/TC-62 guard the *symmetry* of near-term and long-term filtering rather than a specific known root cause (Open Q6).
-- **ASSUMPTION**: Manual Intake exclusion is observable in staging (SQUAWK-6884 is Closed on the Calendar read path; whether the same exclusion applies to the `/by-dimension` count path needs confirmation during TC-56).
-
----
-
-## Test Cases
-
-### Pass 1: Specification Testing — Enforcement
-
-#### Reaching the limit by booking (specific date)
-
-| ID | Component | Summary | Description | Preconditions | Steps | Expected Result | Test Data | Priority | Category | Source |
-|---|---|---|---|---|---|---|---|---|---|---|
-| TC-30 | BookingLimitRule / read path | Count accrues below the limit — availability unchanged | With 1 of 2 new-patient appointments booked on the target date, that date stays fully bookable. | PROV-B + RULE-1 (`New`, max 2); DATE-N (D+2) empty; enforcement flag ON. | 1. Read availability for PROV-B, DATE-N, VR-1, patient type New — record the slot list.<br>2. Book 1 new-patient appointment on DATE-N via Zo.<br>3. Wait for count propagation (≤60s, TC-59).<br>4. Re-read availability for the same params. | Slot list for DATE-N after booking equals the baseline list **minus only the one slot just taken**. No `SyntheticExclusion` is emitted for DATE-N (`RemainingCapacity = 1`). Other DATE-N slots remain returned and bookable. | PROV-B, RULE-1, DATE-N | P0 | Spec — Accrual | AVAIL-422 |
-| TC-31 | BookingLimitRule / read path | Limit reached by booking → whole target date removed | Booking the 2nd new-patient appointment reaches `max_count` and removes the entire date. | Continues from TC-30 (count = 1). | 1. Book a 2nd new-patient appointment on DATE-N via Zo.<br>2. Wait for propagation.<br>3. Re-read availability for PROV-B, DATE-N, VR-1, New.<br>4. Inspect the explainability event / exclusion metadata for DATE-N. | **Zero** slots returned for DATE-N. Exactly one `SyntheticExclusion` for DATE-N with `StartDate = EndDate = DATE-N`, `TimeRanges = null`, and `DailyLimitDecisionMetadata` = `Limit: 2`, `CurrentCount: 2`, `RemainingCapacity: 0`, `TargetingPatientType: New`, `TargetingVisitReasonIds: [VR-1]`, `Outcome: "blocked"`. | PROV-B, RULE-1, DATE-N | P0 | Spec — Limit reached | AVAIL-422 |
-| TC-32 | BookingLimitRule | Limit reached on a far date, near dates untouched | The same accrual behaviour on D+14 confirms it is date-specific, not provider-wide. | PROV-B + RULE-1; DATE-F (D+14) empty; DATE-N empty. | 1. Book 2 new-patient appointments on DATE-F.<br>2. Wait for propagation.<br>3. Read availability for the range D+0 → D+21. | DATE-F returns zero slots; every other date in D+0 → D+21 (including D+13 and D+15) returns its full unfiltered slot list. Exactly one exclusion is emitted, and its `StartDate = EndDate = DATE-F`. | PROV-B, RULE-1, DATE-F | P0 | Spec — Limit reached | AVAIL-422 |
-| TC-33 | BookingLimitRule | Existing-patient bookings accrue against an `Existing` rule | Existing-patient appointments count against a rule scoped to `Existing`. | PROV-B + RULE-3 (`Existing`, max 3); DATE-N empty; 3 synthetic patients with prior completed visits to PROV-B. | 1. Confirm each test patient resolves as **existing** for PROV-B.<br>2. Book existing-patient appointments on DATE-N one at a time, re-reading availability after each.<br>3. Inspect exclusion metadata after the 3rd. | After bookings 1 and 2 the date still returns slots (`RemainingCapacity` 2 then 1, no exclusion). After the 3rd, DATE-N returns zero slots for existing patients with `CurrentCount: 3`, `Limit: 3`, `TargetingPatientType: Existing`. | PROV-B, RULE-3, DATE-N | P0 | Spec — Patient type | AVAIL-422 |
-| TC-34 | BookingLimitRule | `PatientType.All` sums new + existing | One new + one existing booking must reach a limit of 2 on an `All` rule. | PROV-A + RULE-2 (`All`, max 2); DATE-N empty. | 1. Book 1 **new**-patient appointment on DATE-N.<br>2. Book 1 **existing**-patient appointment on DATE-N.<br>3. Wait for propagation; read availability for DATE-N for both patient types. | DATE-N returns zero slots **for both new and existing** patients. Exclusion metadata shows `CurrentCount: 2`, `Limit: 2`, `TargetingPatientType: All` — i.e. the two patient-type buckets were summed, not evaluated separately. | PROV-A, RULE-2, DATE-N | P0 | Spec — Patient type | AVAIL-422 |
-| TC-35 | BookingLimitRule | Patient-type-scoped rule leaves the other type bookable | A `New`-scoped limit at capacity must not block existing patients on the same date. | PROV-B + RULE-1 (`New`, max 2) and **no** existing-patient rule; DATE-N empty. | 1. Book 2 new-patient appointments on DATE-N.<br>2. Wait for propagation.<br>3. Read DATE-N availability as a **new** patient.<br>4. Read DATE-N availability as an **existing** patient.<br>5. Book an existing-patient appointment on DATE-N. | Step 3 returns zero slots. Step 4 returns the full remaining slot list for DATE-N. Step 5 succeeds and the appointment is created. The exclusion is scoped by `TargetingPatientType: New` and is not applied to the existing-patient read. | PROV-B, RULE-1, DATE-N | P0 | Spec — Patient type | AVAIL-422 |
-| TC-36 | BookingLimitRule | Whole-day block, not just remaining-slot block | At capacity the entire calendar day is excluded, including slots at times unrelated to the booked ones. | PROV-B + RULE-1; DATE-N with wide open hours (e.g. 08:00–17:00 provider-local). | 1. Note DATE-N has ≥8 open slots.<br>2. Book the 2 new-patient appointments **both in the morning** (e.g. 08:00, 08:30).<br>3. Wait for propagation; read DATE-N availability. | Zero slots returned for the whole of DATE-N — the untouched afternoon slots (e.g. 14:00, 16:30) are **also** removed. The exclusion carries `TimeRanges = null` (whole day), not a time-bounded range. | PROV-B, RULE-1, DATE-N | P0 | Spec — Whole-day semantics | AVAIL-422 |
-| TC-37 | BookingLimitRule | Exclusion is provider-scoped; unruled provider unaffected | A limit on one provider must not affect a colleague at the same practice, and a provider with no rules must evaluate cleanly. | PROV-B at capacity on DATE-N (from TC-31); PROV-C same practice, no rule. | 1. Read PROV-C availability for DATE-N.<br>2. Book an appointment with PROV-C on DATE-N.<br>3. Read a practice-wide / multi-provider availability response covering both providers.<br>4. Check logs for the non-enrolled evaluation path. | PROV-C returns its full DATE-N slot list and the booking succeeds. The multi-provider response omits DATE-N slots for PROV-B while returning them for PROV-C. PROV-C produces **no** exclusions and no per-provider count lookup is performed for it (enrollment gate, AVAIL-478/AVAIL-589); no errors or warnings logged. | PROV-B, PROV-C, DATE-N | P1 | Spec — Scoping | AVAIL-422, AVAIL-478 |
-| TC-38 | BookingLimitRule | Multi-VR rule combines counts across the VR set | "Max 3 across VR-1/VR-2/VR-3" must count the set together, not per VR. | PROV-A + RULE-4 (max 3, VRs {VR-1, VR-2, VR-3}); DATE-N empty. | 1. Book 1 appointment for VR-1 on DATE-N.<br>2. Book 1 for VR-2 on DATE-N.<br>3. Read DATE-N availability for VR-3 — expect slots still present.<br>4. Book 1 for VR-3 on DATE-N.<br>5. Wait for propagation; read DATE-N for each of VR-1, VR-2, VR-3. | After step 2, VR-3 still returns slots (`CurrentCount: 2`). After step 4, **all three** visit reasons return zero slots for DATE-N, with a single exclusion carrying `CurrentCount: 3`, `Limit: 3`, `TargetingVisitReasonIds: [VR-1, VR-2, VR-3]` — counts summed across the set, not tracked per VR. | PROV-A, RULE-4, DATE-N | P1 | Spec — Multi-VR | AVAIL-422, PRD §4.1.10 |
-
-#### Provider integration shape — non-EHR vs 2-way sync (double-count)
-
-| ID | Component | Summary | Description | Preconditions | Steps | Expected Result | Test Data | Priority | Category | Source |
-|---|---|---|---|---|---|---|---|---|---|---|
-| TC-39 | AppointmentBox `/by-dimension` | Non-EHR provider: do Zocdoc-native bookings even reach the count store? | The count query filters to `appointment_sources = [appointment_list]`. Verify a non-EHR provider's native bookings are represented at all before asserting any filtering. | PROV-A (no EHR) + RULE-1; DATE-N empty. | 1. Query AppointmentBox `/by-dimension` for PROV-A / DATE-N — record the count (expect 0).<br>2. Book 1 new-patient appointment on DATE-N via Zo.<br>3. Re-query `/by-dimension` for PROV-A / DATE-N and inspect the returned buckets, including `appointment_source`.<br>4. Book the 2nd and re-read availability for DATE-N. | The step-3 response contains a bucket for DATE-N / patient_type `new` / VR-1 with `count = 1` and an `appointment_list` source; after step 4 the count is 2 and DATE-N returns zero slots. **If the count stays 0**, enforcement is inert for non-EHR providers — record as a finding against **Open Q1**, do not mark the case passed. | PROV-A, RULE-1, DATE-N | P0 | Spec — Non-EHR | AVAIL-484, Open Q1 |
-| TC-40 | AppointmentBox dedup | **2-way sync: one Zocdoc booking counts once, not twice** | The core double-count concern. A Zocdoc booking written to the EHR and synced back must not produce two count units. | PROV-B (2-way sync, AppointmentList consented) + RULE-1 (max 2); DATE-N empty; sync healthy. | 1. Query `/by-dimension` for PROV-B / DATE-N — confirm count 0.<br>2. Book **exactly one** new-patient appointment on DATE-N via Zo.<br>3. Confirm in the EHR sandbox that the appointment was written to the EHR.<br>4. Wait for the inbound sync cycle to bring the EHR record back into AppointmentList.<br>5. Re-query `/by-dimension` for PROV-B / DATE-N and inspect the **raw buckets**.<br>6. Read DATE-N availability. | Total count for DATE-N / new / VR-1 is **exactly 1**, not 2 — either a single bucket with `count: 1`, or correlated records collapsed to one unit. DATE-N still returns slots with `RemainingCapacity: 1` and **no** exclusion. A count of 2 after one booking is the double-count defect: log it against SQUAWK-6883 and Open Q5. | PROV-B, RULE-1, DATE-N | **P0** | Spec — 2-way sync | **User concern**; AVAIL-484, SQUAWK-6883 |
-| TC-41 | AppointmentBox dedup | 2-way sync: limit is reached at the **real** booking count | The practical consequence of TC-40 — the cap must fire at 2 real bookings, not 1. | PROV-B + RULE-1 (max 2); DATE-N empty; sync healthy. | 1. Book 1 new-patient appointment on DATE-N; wait for a full sync round-trip; read DATE-N availability.<br>2. Book a 2nd new-patient appointment on DATE-N; wait for sync; read DATE-N availability.<br>3. Compare the count trajectory to the same sequence on PROV-A (TC-39) side by side. | After **1** booking DATE-N still returns slots. Only after the **2nd** does DATE-N return zero slots, with `CurrentCount: 2`. The count trajectory for PROV-B (0→1→2) matches PROV-A's exactly — the EHR round-trip adds no extra units. If DATE-N blocks after one booking, that is the double-count defect surfacing as lost availability. | PROV-B vs PROV-A, RULE-1 | **P0** | Spec — 2-way sync | **User concern**; AVAIL-484 |
-| TC-42 | AppointmentBox dedup | 2-way sync: EHR-side edit does not inflate the count | Editing a synced appointment in the EHR (time change, status touch) must update the existing count unit, not append one. | PROV-B + RULE-1 (max 2); one new-patient appointment already booked and synced on DATE-N (count = 1). | 1. In the EHR sandbox, change the appointment's time (same day, DATE-N) and save.<br>2. Wait for the sync cycle.<br>3. Re-query `/by-dimension` for PROV-B / DATE-N.<br>4. Repeat with a benign EHR-side field edit (e.g. note text). | Count for DATE-N remains **1** after both edits — no additional bucket or incremented count from the update, and DATE-N still returns slots with `RemainingCapacity: 1`. A count of 2+ means updates are being treated as inserts. | PROV-B, RULE-1, DATE-N | P1 | Spec — 2-way sync | AVAIL-484, SQUAWK-6883 |
-| TC-43 | AppointmentBox / read path | EHR-native appointments count toward the limit | Appointments booked directly in the PMS (never via Zocdoc) must consume capacity — the limit is global across the provider's calendar. | PROV-B + RULE-1 (max 2); DATE-N empty. | 1. In the EHR sandbox, create 2 new-patient appointments on DATE-N for PROV-B, matching VR-1's canonical mapping.<br>2. Wait for the inbound sync to land them in AppointmentList.<br>3. Query `/by-dimension` for PROV-B / DATE-N.<br>4. Read DATE-N availability on Zo. | `/by-dimension` reports `count = 2` for DATE-N / new / VR-1 sourced from `appointment_list`, and DATE-N returns **zero** slots on Zo with `CurrentCount: 2`, `Outcome: "blocked"` — despite no booking ever passing through Zocdoc. | PROV-B, RULE-1, DATE-N | P0 | Spec — EHR-native | PRD §4.1.9, AVAIL-484 |
-
-#### Channels
-
-| ID | Component | Summary | Description | Preconditions | Steps | Expected Result | Test Data | Priority | Category | Source |
-|---|---|---|---|---|---|---|---|---|---|---|
-| TC-44 | Availability read path — Zo | Zo (`phone_bot`) availability respects the rule | Zo is a launch channel; its availability reads must be filtered. | PROV-B at capacity on DATE-N (count = limit); DATE-N+1 open. | 1. Request availability through the Zo path with channel param `phone_bot` for D+0 → D+7.<br>2. Attempt to select DATE-N through the Zo booking flow.<br>3. Confirm DATE-N+1 is still offered. | The `phone_bot` response contains **no** slots for DATE-N; DATE-N+1 slots are present. DATE-N cannot be selected/confirmed through the Zo flow. The exclusion appears in the explainability event with the request's `phone_bot` channel context. | PROV-B, DATE-N, `phone_bot` | P0 | Spec — Channel | PRD §4.3.11, AVAIL-424 |
-| TC-45 | Availability read path — Branded Directory | Branded Directory (`branded_directory`) availability respects the rule | The second launch channel must filter identically to Zo. | Same as TC-44. | 1. Request availability with channel param `branded_directory` for D+0 → D+7.<br>2. Load the Branded Directory booking widget for PROV-B.<br>3. Compare the returned slot set to the Zo response from TC-44. | The `branded_directory` response contains no slots for DATE-N and the widget offers no DATE-N times. The filtered slot set is **identical** to the Zo response for the same date range — no channel-specific divergence in what the rule removes. | PROV-B, DATE-N, `branded_directory` | P0 | Spec — Channel | PRD §4.3.11, AVAIL-424 |
-| TC-46 | Availability read path — Marketplace | Marketplace (no channel param) — probe whether the filter applies | Rules live in the channel-agnostic `AvailabilityControllerHelper`, but the rollout plan defers Marketplace. Record actual behavior. | Same as TC-44; Marketplace search/profile reachable for PROV-B. | 1. Request availability with **no** channel param (Marketplace) for D+0 → D+7.<br>2. Load PROV-B's Marketplace profile and the search-result availability card.<br>3. Attempt to book DATE-N via Marketplace.<br>4. Record which behavior occurred. | **Decision point, not a guess.** Record exactly one: **(a) Filtered** — DATE-N absent from Marketplace availability and unbookable, matching Zo/BD; enforcement is channel-agnostic and the PRD's staged rollout has no code-level gate → raise against Open Q2. **(b) Not filtered** — DATE-N slots present and bookable on Marketplace only; a channel gate exists and matches the rollout plan. Either way the count must still be consumed. Escalate (a) to product before enforcement ramp. | PROV-B, DATE-N, no channel param | P1 | Spec — Channel probe | Open Q2, AVAIL-424 |
-| TC-47 | BookingLimitRule | Counting is global across channels | A booking on one channel must shrink availability on the others (PRD §4.1.9). | PROV-B + RULE-1 (max 2); DATE-N empty. | 1. Book 1 new-patient appointment on DATE-N via **Zo**.<br>2. Book the 2nd via **Branded Directory**.<br>3. Wait for propagation.<br>4. Read DATE-N availability via Zo, Branded Directory, and Marketplace. | DATE-N returns zero slots on **both** Zo and Branded Directory even though each channel only ever placed one booking — the count is a single provider-day total, not per-channel. `CurrentCount: 2` in a single exclusion. Marketplace behaves per the TC-46 finding. | PROV-B, RULE-1, DATE-N | P0 | Spec — Cross-channel | PRD §4.1.9 |
-
-#### Horizon — near term vs long term
-
-| ID | Component | Summary | Description | Preconditions | Steps | Expected Result | Test Data | Priority | Category | Source |
-|---|---|---|---|---|---|---|---|---|---|---|
-| TC-48 | `GetFirstAvailability` | Near-term filtering on the first-availability path | The next-available path is wired separately from the range path (AVAIL-424) and must filter D+0/D+1/D+2. | PROV-B + RULE-1 (max 2); D+0, D+1, D+2 all open. | 1. Call the `GetFirstAvailability` path for PROV-B — record the returned first-available date/time.<br>2. Fill D+0 to capacity (2 new-patient bookings); wait for propagation; call again.<br>3. Fill D+1 to capacity; call again.<br>4. Fill D+2 to capacity; call again. | Step 1 returns a D+0 slot. After step 2 the first-available result **skips D+0** and returns the earliest D+1 slot. After step 3 it returns D+2. After step 4 it returns D+3 or later. At no point does a capacity-reached date appear as the first-available result, and no "next available" card or search-result snippet shows a blocked date. | PROV-B, RULE-1, D+0/1/2 | **P0** | Spec — Near term | AVAIL-424, **user ask** |
-| TC-49 | `GetAvailability` | Long-term filtering on the range path at D+14 | Re-confirm the horizon already manually validated, on the range read path. | PROV-B + RULE-1 (max 2); D+14 open. | 1. Fill D+14 to capacity (2 new-patient bookings); wait for propagation.<br>2. Request availability for the range D+7 → D+21.<br>3. Request a narrow range covering only D+13 → D+15. | Both requests return zero slots for D+14 while returning full slot lists for D+13 and D+15. Exactly one exclusion is emitted, `StartDate = EndDate = D+14`. The narrow-range request filters identically to the wide one — the result does not depend on the requested window size or on D+14's position within it. | PROV-B, RULE-1, D+14 | **P0** | Spec — Long term | AVAIL-424, **user ask** |
-| TC-50 | `GetAvailability` / `GetFirstAvailability` | Further-out filtering: D+30, D+90, D+364 | Push well beyond the 2-week horizon already tested. | PROV-B + RULE-1 (max 2); D+30, D+90, D+364 open (extend availability templates as needed). | 1. For each of D+30, D+90, D+364: fill to capacity, wait for propagation, then request a range spanning that date **and** call the first-availability path with a start date just before it.<br>2. After all three, request a single wide range D+0 → D+400. | Each of D+30, D+90, D+364 returns zero slots on **both** read paths, with its own exclusion (`StartDate = EndDate` = that date). Neighbouring dates (D+29/31, D+89/91, D+363/365) return full slot lists. The wide D+0 → D+400 request blocks all three dates simultaneously and no others — filtering does not degrade with distance or with range width. | PROV-B, RULE-1, D+30/90/364 | **P1** | Spec — Long term | **User ask** |
-| TC-51 | Count-query horizon | Behavior at and beyond the `now + 5 years` ceiling | AVAIL-484 caps the count query at ~now+5y; availability past that is unfiltered by construction. | PROV-B + RULE-1; availability opened at D+(5y − 2d) and D+(5y + 30d). | 1. Fill D+(5y − 2d) to capacity; wait for propagation; request that range.<br>2. Fill D+(5y + 30d) to capacity; wait; request that range.<br>3. Inspect the `/by-dimension` request's `to_appointment_time_utc`. | D+(5y − 2d) returns zero slots (inside the horizon, enforced). For D+(5y + 30d), record actual behavior: slots most likely **still returned** because the count query's `to_appointment_time_utc` ≈ now+5y excludes it — document the ceiling and confirm it is acceptable rather than treating it as a pass/fail. `to_appointment_time_utc` is ≈ now + 5 years, not unbounded. | PROV-B, RULE-1, 5-year edge | P2 | Spec — Horizon edge | AVAIL-484 |
-| TC-52 | Count-query horizon | Lower edge: same-day (D+0) and the `yesterday 00:00 UTC` floor | The count window starts at yesterday 00:00 UTC; same-day enforcement must work and past days must not leak into today's count. | PROV-B + RULE-1 (max 2); D+0 open with slots later today; 2 appointments already existing on D−1. | 1. Confirm D−1 already holds 2 new-patient appointments.<br>2. Read D+0 availability — D−1's appointments must not count against D+0.<br>3. Fill D+0 to capacity with 2 bookings; wait for propagation.<br>4. Re-read D+0 availability, and read D−1 (past) availability. | Step 2 returns D+0's full remaining slot list (`CurrentCount: 0` for D+0 — yesterday's 2 appointments are counted against D−1 only, never pooled into D+0). Step 4 returns zero slots for D+0 with `CurrentCount: 2`. D−1 exposes no bookable slots regardless (past date) and produces no error. | PROV-B, RULE-1, D+0/D−1 | P1 | Spec — Horizon edge | AVAIL-484 |
-
-### Pass 2: Breakage Hunting
-
-#### Count exclusions — what must NOT count
-
-| ID | Component | Summary | Description | Preconditions | Steps | Expected Result | Test Data | Priority | Category | Source |
-|---|---|---|---|---|---|---|---|---|---|---|
-| TC-53 | Count recompute | Cancellation frees capacity and returns the day | Cancelled appointments must not count; the day must become bookable again. | PROV-B at capacity on DATE-N (`CurrentCount: 2`, zero slots). | 1. Confirm DATE-N returns zero slots.<br>2. Cancel one of the two appointments (patient-cancel).<br>3. Wait for propagation.<br>4. Re-read DATE-N availability and `/by-dimension`.<br>5. Repeat with a **provider**-cancel on a re-filled day. | Count drops to 1, the DATE-N exclusion is no longer emitted, and DATE-N returns its remaining slot list — bookable again. Both `patient_cancelled` and `provider_cancelled` are excluded from the count per the AVAIL-484 status filter. No stale exclusion persists after the propagation window. | PROV-B, RULE-1, DATE-N | P0 | Breakage — Counting | AVAIL-484, PRD §2 |
-| TC-54 | Count recompute | No-shows do not count | A no-show must not consume capacity. | PROV-B + RULE-1 (max 2); a past-or-today date with 2 appointments where one can be marked no-show. | 1. On the target date, mark one appointment `no_show` in the EHR/provider tool.<br>2. Wait for propagation.<br>3. Query `/by-dimension` and read availability for that date. | Count for the date is **1**, not 2; the `no_show` record is excluded by the status filter. The date returns slots again (if not otherwise in the past) with no exclusion emitted. | PROV-B, RULE-1 | P1 | Breakage — Counting | AVAIL-484 |
-| TC-55 | Count recompute | Reschedule moves the count between dates | Rescheduling must decrement the origin date and increment the destination. | PROV-B + RULE-1 (max 2); DATE-N at capacity (2 appts); DATE-N+1 holds 1 appointment. | 1. Confirm DATE-N blocked, DATE-N+1 open (count 1).<br>2. Reschedule one DATE-N appointment to DATE-N+1.<br>3. Wait for propagation.<br>4. Read availability and `/by-dimension` for both dates. | DATE-N count = 1 → exclusion gone, slots returned. DATE-N+1 count = 2 → whole day blocked, exclusion emitted. The reschedule is counted **once at its destination only** — total across the two dates stays 3, with no phantom unit left on DATE-N. | PROV-B, RULE-1, DATE-N/N+1 | P1 | Breakage — Counting | PRD §2 |
-| TC-56 | Count recompute | Manual Intake records do not count | Manual intake requests are not real appointments and must not consume capacity. | PROV-B + RULE-1 (max 2); DATE-N with 1 real appointment; ability to create a Manual Intake record on DATE-N. | 1. Note DATE-N count = 1, slots present.<br>2. Create 2 Manual Intake records on DATE-N.<br>3. Wait for propagation.<br>4. Query `/by-dimension` and read DATE-N availability. | Count for DATE-N remains **1** — Manual Intake records are excluded from the count path (SQUAWK-6884). DATE-N still returns slots with `RemainingCapacity: 1` and no exclusion. If the count rises to 3 and the day blocks, the exclusion is missing on the `/by-dimension` path — log against Open Q8/SQUAWK-6884. | PROV-B, RULE-1, DATE-N | P1 | Breakage — Counting | SQUAWK-6884, PRD §2 |
-
-#### Timezone & multi-location
-
-| ID | Component | Summary | Description | Preconditions | Steps | Expected Result | Test Data | Priority | Category | Source |
-|---|---|---|---|---|---|---|---|---|---|---|
-| TC-57 | Timezone grouping | Late-evening booking counts against the provider-local day, not the UTC day | A 21:00 PT appointment is 04:00 UTC the next day — it must count against the PT calendar day. | PROV-D, location in `America/Los_Angeles`, daily limit max 2, DATE-N open with a ≥21:00 local slot. | 1. Book 1 new-patient appointment at **21:00 America/Los_Angeles** on DATE-N (= 04:00 UTC on DATE-N+1).<br>2. Book a 2nd at 21:30 local the same DATE-N.<br>3. Wait for propagation.<br>4. Query `/by-dimension` and read availability for DATE-N **and** DATE-N+1. | Both bookings are counted against **DATE-N** (provider-local): DATE-N count = 2, whole day blocked. DATE-N+1 count = **0** and returns its full slot list — no capacity leaked forward across the UTC boundary. The `/by-dimension` request carries the provider's `iana_time_zone_id`. | PROV-D, `America/Los_Angeles` | P0 | Breakage — Timezone | AVAIL-484, PRD §2 |
-| TC-58 | Timezone grouping + functional dedup | Multi-timezone provider: limit shared across locations; duplicate zones collapse | A provider working two timezones the same day shares one limit; functionally identical zones must not double-query or double-count. | PROV-D with locations in `America/Los_Angeles`, `America/New_York`, and `US/Eastern`; provider-level limit max 2; DATE-N open at all three. | 1. Book 1 appointment at the LA location and 1 at the NY location, both on DATE-N provider-local.<br>2. Wait for propagation.<br>3. Read DATE-N availability for **all three** locations.<br>4. Inspect the `/by-dimension` calls issued for PROV-D / DATE-N. | DATE-N is blocked at **all three** locations — the limit is shared across locations, not per-location (provloc is a later phase). Count = 2, not 3: `America/New_York` and `US/Eastern` are collapsed as functionally identical (equal summer **and** winter offsets), producing **one** call per distinct zone (2 calls, not 3) and no duplicate count units. | PROV-D, 3 locations | P1 | Breakage — Timezone | AVAIL-484 |
-
-#### Resilience, timing, race
-
-| ID | Component | Summary | Description | Preconditions | Steps | Expected Result | Test Data | Priority | Category | Source |
-|---|---|---|---|---|---|---|---|---|---|---|
-| TC-59 | Valkey aggregate rebuild | Propagation latency booking → availability | Bound the window in which availability is stale after a booking or cancellation. | PROV-B + RULE-1 (max 2); DATE-N with 1 appointment; stopwatch/log timestamps available. | 1. Book the appointment that reaches capacity on DATE-N; record T0.<br>2. Poll DATE-N availability every 5s until zero slots are returned; record T1.<br>3. Cancel one appointment; record T2; poll until slots return; record T3.<br>4. Repeat 3× for both directions. | Both `T1 − T0` (block) and `T3 − T2` (unblock) are ≤ **60s** on every repetition, and the transition is monotonic — availability never flickers between blocked and unblocked. Record actual medians and worst case; any value over 60s is a finding against **Open Q7** (no confirmed SLA). | PROV-B, RULE-1, DATE-N | P1 | Breakage — Timing | AVAIL-486, AVAIL-488, Open Q7 |
-| TC-60 | Fail-open path | Count store unavailable → fail open, but observably | AVAIL-422 returns empty exclusions when counts are unavailable; that must not be silent. | PROV-B at capacity on DATE-N; ability to induce an AppointmentBox/count-store failure or timeout in staging. | 1. Confirm DATE-N is blocked.<br>2. Induce a count-source failure (block the `/by-dimension` dependency or force timeout).<br>3. Read DATE-N availability.<br>4. Check logs/metrics for the failure signal.<br>5. Restore the dependency and re-read. | Step 3 returns DATE-N slots (**fail open** — patients are never shown an error and availability is not lost) with **zero** exclusions emitted. A warning/metric records the count-source failure and distinguishes "counts unavailable" from "no rules configured" — the two must not be indistinguishable in telemetry. Step 5 restores the DATE-N block within the TC-59 window. | PROV-B, DATE-N, induced failure | P1 | Breakage — Resilience | AVAIL-422, Open Q4 |
-| TC-63 | Booking-time revalidation | Concurrent bookings at `limit − 1` | PRD §4.3.8 is unresolved: two patients holding the last slot. | PROV-B + RULE-1 (max 2); DATE-N with exactly 1 appointment (`RemainingCapacity: 1`). | 1. Open two independent booking sessions, both loading DATE-N availability while capacity remains 1.<br>2. Have session A complete its booking.<br>3. Without reloading, have session B submit its booking for DATE-N.<br>4. Inspect the final appointment count on DATE-N. | **Probe — record actual behavior.** Preferred: session B is rejected at commit with a clear "no longer available" message and DATE-N ends with **2** appointments (revalidation exists). If DATE-N ends with **3**, the cap was exceeded by one — expected given no confirmed booking-time revalidation; record against **Open Q3** with the exact sequence. Either way session B must not receive a 500 or a silent success with no appointment. | PROV-B, RULE-1, DATE-N | P2 | Breakage — Race | PRD §4.3.8, Open Q3 |
-| TC-64 | BookingLimitRule | Overbooked beyond the limit stays blocked, no error | `count > limit` (via EHR-side overbooking) must remain blocked without negative remaining-capacity artifacts. | PROV-B + RULE-1 (max 2); DATE-N with **4** appointments created EHR-side. | 1. Create 4 new-patient appointments on DATE-N in the EHR sandbox; wait for sync.<br>2. Query `/by-dimension` and read DATE-N availability.<br>3. Inspect the exclusion metadata. | DATE-N returns zero slots. Exclusion metadata reads `Limit: 2`, `CurrentCount: 4`, `RemainingCapacity: 0` — clamped at zero, **not** `-2`. No exception, no 500, no malformed explainability event. Cancelling down to 3 keeps the day blocked; cancelling to 1 returns slots. | PROV-B, RULE-1, DATE-N | P2 | Breakage — Boundary | INFERRED |
-
-#### Insurance dimension (smoke)
-
-| ID | Component | Summary | Description | Preconditions | Steps | Expected Result | Test Data | Priority | Category | Source |
-|---|---|---|---|---|---|---|---|---|---|---|
-| TC-65 | BookingLimitRule | Insurance-scoped limit counts only the matching carrier | PRD §4.1.7 allows insurance-scoped limits; verify the count is carrier-scoped, not global. | PROV-B; daily-limit rule scoped to carrier CARRIER-X, max 2; DATE-N open. | 1. Book 2 appointments on DATE-N with insurance **CARRIER-Y**; wait; read DATE-N availability.<br>2. Book 2 on DATE-N with **CARRIER-X**; wait; read DATE-N availability for CARRIER-X and for CARRIER-Y/self-pay. | After step 1 DATE-N still returns slots (`CurrentCount: 0` for the CARRIER-X rule — non-matching insurance does not accrue). After step 2 DATE-N is blocked for CARRIER-X patients while CARRIER-Y/self-pay patients still receive slots. | PROV-B, CARRIER-X/Y | P2 | Breakage — Insurance | PRD §4.1.7 |
-
-### Pass 3: Historical / Regression
-
-| ID | Component | Summary | Description | Preconditions | Steps | Expected Result | Test Data | Priority | Category | Source |
-|---|---|---|---|---|---|---|---|---|---|---|
-| TC-61 | `GetFirstAvailability` | **Regression: near-term filtering must not be skipped** | Guards the near-term half of the previously-fixed near/long-term filtering gap. Locks the near-term read path against re-regression. | PROV-B + RULE-1 (max 2); D+0, D+1, D+2 open. | 1. Fill D+1 to capacity.<br>2. Call the first-availability path with no explicit start date.<br>3. Call it again with a start date of D+1.<br>4. Load the search-result / profile "next available" surface for PROV-B. | D+1 never appears as a first-available result in any of the three surfaces — with no start date, with a start date landing exactly on the blocked day, or on the "next available" card. The result skips to D+2. Filtering applies to the first-availability path, not only the range path. | PROV-B, RULE-1, D+1 | **P0** | Regression — Near term | INFERRED (user-reported fix, Open Q6) |
-| TC-62 | `GetAvailability` | **Regression: long-term filtering must not be skipped** | Guards the long-term half of the same gap, across several window shapes. | PROV-B + RULE-1 (max 2); D+14 open. | 1. Fill D+14 to capacity.<br>2. Request D+14 as a single-day range.<br>3. Request D+8 → D+21 (blocked date mid-window).<br>4. Request D+14 → D+28 (blocked date at window start).<br>5. Request D+1 → D+14 (blocked date at window end). | D+14 returns zero slots in **all four** window shapes — single-day, mid-window, first day, last day. No window shape or boundary position causes the exclusion to be dropped, and all other dates in each window return full slot lists. | PROV-B, RULE-1, D+14 | **P0** | Regression — Long term | INFERRED (user-reported fix, Open Q6) |
-
----
-
-## Historical Context
-
-- **Near/long-term filtering gap (user-reported, fixed; no ticket key supplied)**: filtering did not hold uniformly across near-term and longer-term availability. Manual verification reached ~2 weeks out. `GetAvailability` and `GetFirstAvailability` are wired separately in **AVAIL-424**, which is a plausible structural cause for a horizon- or path-dependent gap. Locked by **TC-48, TC-49, TC-50, TC-61, TC-62**. Re-anchor to the real ticket to tighten these (**Open Q6**).
-- **AVAIL-478 (Closed)**: `BookingLimitProcessor` empty-rules lifecycle bug + `HasRulesAsync` enrollment gate. A provider with no rules must short-circuit before any per-provider count lookup. Touched by **TC-37**; see also AVAIL-589 (pre-gate on a cheap enrollment check, To Do).
-- **AVAIL-484 (Closed)**: established the count-query contract these cases assert against — `appointment_list`-only source, cancelled/no-show excluded, `yesterday 00:00 UTC → now+5y` horizon, per-IANA-zone calls with summer+winter offset dedup. Note the naming trap: AVAIL-484's "functional dedup" is **timezone** dedup, **not** appointment-level dedup. Appointment-level cross-source dedup is **SQUAWK-6883**, still **To Do** — which is exactly why the 2-way-sync double-count concern is live.
-- **SQUAWK-6884 (Closed)**: Manual Intake excluded from the Calendar read path. Whether the same exclusion holds on the `/by-dimension` count path is unconfirmed — **TC-56** checks it.
-- **SQUAWK-6765 (Closed)**: Daily Limits only surface for practices with an eligible EHR — the basis for **Open Q1** (whether non-EHR providers can enforce at all).
-- **AVAIL-422 (Closed)**: `AppointmentBox` empty counts → empty exclusions, i.e. deliberate fail-open on the read path. Exercised by **TC-60**.
+1. **TC-W16** — when a location's timezone changes, are the stored hours reinterpreted in the new zone (09:00 stays 09:00) or converted (09:00 ET → 08:00 CT)? The expected result depends entirely on this.
+2. **TC-W18** — are overlapping hour blocks rejected or merged? Both are defensible; the test needs the product's answer.
+3. **TC-W19** — what is the documented maximum lead time value?
+4. **A7 / `{SLA}`** — what is the actual propagation SLA between an Intake Settings save and PFS reflecting it? Every propagation case needs this number.
+5. Is business-hours-aware accrual behind a feature flag? If so, both flag states need coverage in the daily set, not just weekly (TC-W06).
+6. Can the test environment reliably set the system clock to arbitrary dates? If not, TC-W08–W11 need a different strategy (seeded fixture dates) and their steps must be rewritten.
 
 ---
 
 ## Exit Criteria
 
-### Must Pass (blocking enforcement ramp)
-- **TC-30, TC-31, TC-32, TC-33, TC-34, TC-35, TC-36** — the limit is actually reached by booking, and blocks the right date and patient type.
-- **TC-39, TC-40, TC-41, TC-43** — count integrity for both provider shapes. **TC-40/TC-41 are hard blockers**: a confirmed double count means enforcement removes real availability and must not ramp.
-- **TC-44, TC-45, TC-47** — Zo and Branded Directory both filter, and counting is global across channels.
-- **TC-48, TC-49, TC-61, TC-62** — near-term and long-term filtering both hold, on both read paths.
-- **TC-52, TC-53, TC-57** — same-day/floor boundary, cancellation frees capacity, timezone anchoring correct.
+**Daily set — blocking**
+- All 14 cases pass. Any failure in TC-D01–D09 or TC-D13–D14 blocks the deploy: these are the cases where breakage means patients see wrong times or cannot book.
+- TC-D10, TC-D11, TC-D12 failures require a filed ticket and an explicit sign-off to proceed.
 
-### Should Pass (non-blocking with sign-off)
-- TC-37, TC-38, TC-42, TC-50, TC-54, TC-55, TC-56, TC-58, TC-59, TC-60.
-- **TC-46** must be *executed and its outcome recorded* before ramp even though it has no pass/fail — Marketplace behavior must be a known decision, not a surprise.
+**Weekly set — blocking with sign-off**
+- All P0 cases (TC-W01, W02, W05, W08–W11) must pass.
+- P1 failures need a filed ticket before the next release train.
+- P2 failures (TC-W24, W25, W26) are tracked, non-blocking.
 
-### Recommended Before Full Rollout
-- TC-51, TC-65, TC-63, TC-64 executed and results recorded.
-- **Open Q1 (non-EHR enforcement), Q2 (Marketplace gate), and Q5 (dedup shipped?) resolved** — these three change what "correct" means for whole sections of this plan.
-- Open Q3 (booking-time revalidation) and Q4 (fail-open fallback + alarm) have documented answers.
+**Around DST transitions**: promote TC-W08–W11 into the daily set for the week before and the week after each US transition.
 
 ---
 
 ## Exploratory Testing Charters
 
 | Charter | Mission | Time Box | Focus Areas |
-|---|---|---|---|
-| 2-way-sync count forensics | Drive appointments through every EHR-side mutation and watch raw `/by-dimension` buckets for extra units | 90 min | Create in EHR vs create on Zocdoc, time edit, VR/provider change, cancel-in-EHR vs cancel-on-Zocdoc, delete-then-recreate, sync replay/backfill, sync outage then catch-up |
-| Horizon sweep | Probe filtering across the whole bookable span to find any horizon where it silently stops | 60 min | D+0 … D+400 at intervals, DST transition dates, month/year boundaries, leap day, the now+5y ceiling, `GetFirstAvailability` vs `GetAvailability` at each |
-| Channel parity diff | Same provider, same date, same rule — diff the slot sets across all three channels | 60 min | `phone_bot` vs `branded_directory` vs no-param, logged-in vs anonymous, deep-link into a blocked date, cached/CDN responses, mobile vs desktop surfaces |
-| Timezone abuse | Hunt off-by-one-day blocking around midnight and DST | 60 min | 23:45 and 00:15 provider-local bookings, spring-forward/fall-back dates, provider tz ≠ patient tz ≠ server tz, multi-location same-day, `US/Eastern` ≡ `America/New_York` |
-| Capacity thrash | Rapidly cross the limit boundary in both directions and look for stuck or flickering availability | 45 min | Book/cancel/rebook loops, simultaneous cancel + book, reschedule chains across dates, stale exclusions after cancel, count drift after many cycles |
-| Blast-radius check | Confirm one provider's limit never affects anyone else | 45 min | Same-practice colleagues, shared locations, supervisor/resource configs, practice-wide and search-level availability responses, multi-provider result cards |
+|---------|---------|----------|-------------|
+| Clock drift hunt | Sit on a PFS page across a lead-time boundary without reloading and watch what happens to the slot list | 30 min | Does a slot silently become unbookable? Is the list refreshed client-side or frozen at page load? |
+| Hours-config fuzzing | Push the Intake Settings hours fields into unusual shapes — 00:00–00:00, single-minute windows, all days closed, 24h open | 45 min | Validation gaps, PFS rendering of degenerate configs |
+| Timezone matrix sweep | Cycle a patient browser through 6 timezones (including UTC, IST, and a half-hour-offset zone) against one provider | 45 min | Half-hour-offset zones, timezone label correctness, off-by-one-day errors |
+| Provider-perspective sanity | As a practice, configure realistic hours and confirm the resulting PFS availability matches what a front-desk person would expect | 60 min | Semantic correctness rather than mechanical correctness — the thing unit tests never catch |
+
+---
+
+## Xray Import Notes
+
+Two test sets to create:
+- `Regression — Daily — Lead Time & Business Hours` → TC-D01 … TC-D14
+- `Regression — Weekly — Lead Time & Business Hours` → TC-W01 … TC-W26
+
+Component for all cases: split between `Intake Settings` and `PFS Availability` per the Component column. Label all cases `leadtime` and `business-hours`; add `dst` to TC-W08–W13 so they can be pulled into the daily set on demand around transitions.
